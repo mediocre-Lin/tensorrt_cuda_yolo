@@ -1,0 +1,499 @@
+#include <cuda.h>
+#include <cuda_device_runtime_api.h>
+#include <cuda_runtime_api.h>
+#include <device_launch_parameters.h>
+#include <stdio.h>
+
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#include "opencv2/core/cuda.hpp"
+#include "opencv2/core/cuda_stream_accessor.hpp"
+#include "opencv2/cudaarithm.hpp"
+#include "opencv2/cudaimgproc.hpp"
+#include "opencv2/cudawarping.hpp"
+#include "opencv2/opencv.hpp"
+#include "thread_pool.h"
+#include "yolov7.h"
+#define TIMERSTART(tag) \
+  auto tag##_start = std::chrono::steady_clock::now(), tag##_end = tag##_start
+#define TIMEREND(tag) tag##_end = std::chrono::steady_clock::now()
+#define DURATION_s(tag)                                                \
+  printf("%s costs %d s\n", #tag,                                      \
+         std::chrono::duration_cast<std::chrono::seconds>(tag##_end -  \
+                                                          tag##_start) \
+             .count())
+#define DURATION_ms(tag)                                                    \
+  printf("%s costs %d ms\n", #tag,                                          \
+         std::chrono::duration_cast<std::chrono::milliseconds>(tag##_end -  \
+                                                               tag##_start) \
+             .count());
+#define DURATION_us(tag)                                                    \
+  printf("%s costs %d us\n", #tag,                                          \
+         std::chrono::duration_cast<std::chrono::microseconds>(tag##_end -  \
+                                                               tag##_start) \
+             .count());
+#define DURATION_ns(tag)                                                   \
+  printf("%s costs %d ns\n", #tag,                                         \
+         std::chrono::duration_cast<std::chrono::nanoseconds>(tag##_end -  \
+                                                              tag##_start) \
+             .count());
+
+// void test_navie(const int batch_num, const int warm_up_num, const int
+// data_num,
+//                 const int infer_num) {
+//   YOLOInfer YoloDet = YOLOInfer();
+//   YoloDet.SetUp("model.trt", 30, true, batch_num, 1024, 1024, {0, 0, 0},
+//                 {1, 1, 1});
+//   cv::Mat bigMat(8000, 50000, CV_8UC3);  // 假设为float类型
+//   cv::Size blockSize(1000, 800);
+//   std::vector<cv::Mat> img_set;
+//   std::vector<DetPredictorOutput> res;
+//   img_set.resize(batch_num);
+//   int count = 0;
+//   for (int y = 0; y < bigMat.rows; y += blockSize.height) {
+//     for (int x = 0; x < bigMat.cols; x += blockSize.width) {
+//       // 计算当前块的范围
+//       TIMERSTART(LOAD_IMG);
+//       cv::Rect roi(x, y, blockSize.width, blockSize.height);
+//       // 确保不超出边界
+//       roi.width = std::min(roi.width, bigMat.cols - x);
+//       roi.height = std::min(roi.height, bigMat.rows - y);
+//       img_set[count++] = bigMat(roi).clone();
+//       TIMEREND(LOAD_IMG);
+//       DURATION_ms(LOAD_IMG);
+//       if (count == batch_num) {
+//         TIMERSTART(batch);
+//         YoloDet.Infer(img_set);
+//         YoloDet.GetRes(res);
+//         count = 0;
+//         TIMEREND(batch);
+//         DURATION_ms(batch);
+//       }
+//     }
+//   }
+//   TIMERSTART(pic);
+//   for (int y = 0; y < bigMat.rows; y += blockSize.height) {
+//     for (int x = 0; x < bigMat.cols; x += blockSize.width) {
+//       // 计算当前块的范围
+//       cv::Rect roi(x, y, blockSize.width, blockSize.height);
+//       // 确保不超出边界
+//       roi.width = std::min(roi.width, bigMat.cols - x);
+//       roi.height = std::min(roi.height, bigMat.rows - y);
+//       img_set[count++] = bigMat(roi);
+//       if (count == batch_num) {
+//         YoloDet.Infer(img_set);
+//         YoloDet.GetRes(res);
+//         count = 0;
+//       }
+//     }
+//   }
+//   TIMEREND(pic);
+//   DURATION_ms(pic);
+// }
+
+// void test_navie_3(const int batch_num, const int warm_up_num, const int
+// data_num,
+//                 const int infer_num) {
+//   YOLOInfer YoloDet = YOLOInfer();
+//   YoloDet.SetUp("model.trt", 30, true, batch_num, 1024, 1024, {0, 0, 0},
+//                 {1, 1, 1});
+//   cv::Mat bigMat(8000, 50000, CV_8UC3);  // 假设为float类型
+//   cv::cuda::GpuMat d_bigMat(bigMat);
+//   cv::Size blockSize(1000, 800);
+//   std::vector<cv::Rect> roi_set;
+//   std::vector<DetPredictorOutput> res;
+//   roi_set.resize(batch_num);
+//   int count = 0;
+//   for (int y = 0; y < bigMat.rows; y += blockSize.height) {
+//     for (int x = 0; x < bigMat.cols; x += blockSize.width) {
+//       // 计算当前块的范围
+//       cv::Rect roi(x, y, blockSize.width, blockSize.height);
+//       // 确保不超出边界
+//       roi.width = std::min(roi.width, bigMat.cols - x);
+//       roi.height = std::min(roi.height, bigMat.rows - y);
+//       roi_set[count++] = roi;
+//       if (count == batch_num) {
+//         TIMERSTART(batch);
+//         YoloDet.Infer(d_bigMat, roi_set);
+//         YoloDet.GetRes(res);
+//         count = 0;
+//         TIMEREND(batch);
+//         DURATION_ms(batch);
+//       }
+//     }
+//   }
+//   TIMERSTART(pic);
+//   TIMERSTART(allocGPUMat);
+//   cv::cuda::GpuMat d_pic_bigMat(bigMat);
+//   TIMEREND(allocGPUMat);
+//   DURATION_ms(allocGPUMat);
+//   for (int y = 0; y < bigMat.rows; y += blockSize.height) {
+//     for (int x = 0; x < bigMat.cols; x += blockSize.width) {
+//       // 计算当前块的范围
+//       cv::Rect roi(x, y, blockSize.width, blockSize.height);
+//       // 确保不超出边界
+//       roi.width = std::min(roi.width, bigMat.cols - x);
+//       roi.height = std::min(roi.height, bigMat.rows - y);
+//             roi_set[count++] = roi;
+
+//       if (count == batch_num) {
+//          YoloDet.Infer(d_pic_bigMat, roi_set);
+//         YoloDet.GetRes(res);
+//         count = 0;
+//       }
+//     }
+//   }
+//   TIMEREND(pic);
+//   DURATION_ms(pic);
+// }
+
+// void test_navie_2(const int batch_num, const int warm_up_num,
+//                   const int data_num, const int infer_num) {
+//   YOLOInfer YoloDet = YOLOInfer();
+//   YoloDet.SetUp("model.trt", 30, true, batch_num, 1024, 1024, {0, 0, 0},
+//                 {1, 1, 1});
+//   cv::Mat img_in = cv::imread("test.jpg");
+//   cv::resize(img_in, img_in, {1024, 1024});
+//   std::vector<cv::Mat> img_set;
+//   std::vector<DetPredictorOutput> res;
+//   img_set.resize(batch_num);
+//   for (int i = 0; i < batch_num; ++i) {
+//     img_set[i] = img_in.clone();
+//   }
+//   int count = 0;
+//   for (int w_i = 0; w_i < warm_up_num; ++w_i) {
+//     for (int infer_i = 0; infer_i < data_num; infer_i += batch_num) {
+
+//       TIMERSTART(COPY_IMG);
+// #pragma omp parallel for
+//       for (int i = 0; i < batch_num; ++i) {
+//         img_set[i] = img_in;
+//       }
+//       TIMEREND(COPY_IMG);
+//       DURATION_ms(COPY_IMG);
+//       TIMERSTART(INFER_BATCH);
+//       YoloDet.Infer(img_set);
+//       YoloDet.GetRes(res);
+//       TIMEREND(INFER_BATCH);
+//       DURATION_ms(INFER_BATCH);
+//     }
+//   }
+
+//   TIMERSTART(pic);
+//   for (int w_i = 0; w_i < infer_num; ++w_i) {
+//     for (int infer_i = 0; infer_i < data_num; infer_i += batch_num) {
+// #pragma omp parallel for
+//       for (int i = 0; i < batch_num; ++i) {
+//         img_set[i] = img_in;
+//       }
+//       YoloDet.Infer(img_set);
+//       YoloDet.GetRes(res);
+//     }
+//   }
+//   TIMEREND(pic);
+//   DURATION_ms(pic);
+// }
+
+// class ThreadPoolTestDet {
+//  public:
+//   bool setup(int batch_num) {
+//     YoloDet_ = YOLOInfer();
+//     YoloDet_.SetUp("model.trt", 30, true, batch_num, 1024, 1024, {0, 0, 0},
+//                    {1, 1, 1});
+//   }
+//   bool det(std::vector<cv::Mat> img_set, std::vector<DetPredictorOutput>&
+//   res) {
+//     std::lock_guard<std::mutex> lock(mutex_);
+//     YoloDet_.Infer(img_set);
+//     return YoloDet_.GetRes(res);
+//   }
+//   ThreadPoolTestDet() {}
+//   ThreadPoolTestDet(const ThreadPoolTestDet& other) {
+//     YoloDet_ = other.YoloDet_;
+//   }
+//   ThreadPoolTestDet& operator=(const ThreadPoolTestDet& det) {
+//     YoloDet_ = det.YoloDet_;
+//     return *this;
+//   }
+
+//  private:
+//   std::mutex mutex_;
+//   YOLOInfer YoloDet_;
+// };
+// void test_thread_pool(const int batch_num, const int warm_up_num,
+//                       const int data_num, const int infer_num,
+//                       const int thread_pool_num) {
+//   ThreadPool pool(thread_pool_num);
+//   std::vector<ThreadPoolTestDet> model_set;
+//   std::vector<std::vector<cv::Mat>> img_set;
+//   model_set.resize(thread_pool_num);
+//   img_set.resize(thread_pool_num);
+//   std::vector<DetPredictorOutput> det_res;
+//   cv::Mat img_in = cv::imread("test.jpg");
+//   cv::resize(img_in, img_in, {1024, 1024});
+
+//   for (int i = 0; i < thread_pool_num; ++i) {
+//     model_set[i] = ThreadPoolTestDet();
+//     model_set[i].setup(batch_num);
+//     img_set[i].resize(batch_num);
+//     for (int b_i = 0; b_i < batch_num; ++b_i) {
+//       img_set[i][b_i] = img_in.clone();
+//     }
+//   }
+//   std::vector<std::future<bool>> results;
+//   std::vector<bool> res;
+//   res.resize(data_num);
+
+//   for (int k = 0; k < 1; ++k) {
+//     for (int infer_idx = 0;
+//          infer_idx < (data_num / thread_pool_num / batch_num); ++infer_idx) {
+//       TIMERSTART(BATCH);
+
+//       for (int thread_idx = 0; thread_idx < thread_pool_num; ++thread_idx) {
+//         results.emplace_back(
+//             pool.enqueue([thread_idx, infer_idx,
+//             thread_pool_num,batch_num,&img_in, &model_set,
+//                           &img_set, &res, &det_res] {
+//       #pragma omp parallel for
+//               for (int b_i = 0; b_i < batch_num; ++b_i) {
+//                 img_set[thread_idx][b_i] = img_in.clone();
+//               }
+//               res[infer_idx * thread_pool_num + thread_idx] =
+//                   model_set[thread_idx].det(img_set[thread_idx], det_res);
+
+//               return true;
+//             }));
+//       }
+//       for (int thread_idx = 0; thread_idx < thread_pool_num; ++thread_idx) {
+//         results[infer_idx * thread_pool_num + thread_idx].get();
+//       }
+//       TIMEREND(BATCH);
+//       DURATION_ms(BATCH);
+//     }
+//   }
+
+//   std::cout << "infer" << std::endl;
+
+//   TIMERSTART(infer);
+
+//   for (int k = 0; k < infer_num; ++k) {
+//     std::vector<std::future<bool>> infer_results;
+//     std::vector<bool> infer_res;
+//     infer_res.resize(data_num);
+//     for (int infer_idx = 0;
+//          infer_idx < (data_num / thread_pool_num / batch_num); ++infer_idx) {
+//       for (int thread_idx = 0; thread_idx < thread_pool_num; ++thread_idx) {
+//         infer_results.emplace_back(
+//             pool.enqueue([thread_idx, infer_idx,
+//             thread_pool_num,batch_num,&img_in, &model_set,
+//                           &img_set, &infer_res, &det_res] {
+//       #pragma omp parallel for
+//               for (int b_i = 0; b_i < batch_num; ++b_i) {
+//                 img_set[thread_idx][b_i] = img_in.clone();
+//               }
+//               infer_res[infer_idx * thread_pool_num + thread_idx] =
+//                   model_set[thread_idx].det(img_set[thread_idx], det_res);
+
+//               return true;
+//             }));
+//       }
+//       for (int thread_idx = 0; thread_idx < thread_pool_num; ++thread_idx) {
+//         infer_results[infer_idx * thread_pool_num + thread_idx].get();
+//       }
+//     }
+//   }
+
+//   TIMEREND(infer);
+//   DURATION_ms(infer);
+// }
+
+// void block_8k_50k_opencv_cuda(const cv::Mat& data) {
+//   cv::cuda::GpuMat d_data = cv::cuda::GpuMat();
+//   TIMERSTART(block_8k_50k_opencv_cuda);
+
+//   d_data.upload(data);
+//   cv::Size blockSize(1000, 800);
+
+//   cv::cuda::Stream cv_stream;
+//   for (int y = 0; y < data.rows; y += blockSize.height) {
+//     for (int x = 0; x < data.cols; x += blockSize.width) {
+//       cv::cuda::GpuMat d_block;
+//       // 计算当前块的范围
+//       cv::Rect roi(x, y, blockSize.width, blockSize.height);
+//       // 确保不超出边界
+//       roi.width = std::min(roi.width, data.cols - x);
+//       roi.height = std::min(roi.height, data.rows - y);
+//       d_block = d_data(roi);
+//     }
+//   }
+//   cudaDeviceSynchronize();
+//   TIMEREND(block_8k_50k_opencv_cuda);
+//   DURATION_ms(block_8k_50k_opencv_cuda);
+// }
+
+// void block_8k_50k_opencv_cuda_2(const cv::Mat& data, int n_stream = 10) {
+//   TIMERSTART(block_8k_50k_opencv_cuda_2);
+//   cv::Size blockSize(1000, 800);
+//   std::vector<cv::cuda::Stream> cv_streams;
+//   std::vector<cv::cuda::GpuMat> d_mats;
+
+//   cv_streams.resize(n_stream);
+//   d_mats.resize(n_stream);
+//   for (int i = 0; i < cv_streams.size(); ++i) {
+//     cv_streams[i] = cv::cuda::Stream();
+//   }
+//   int count = 0;
+//   for (int y = 0; y < data.rows; y += blockSize.height) {
+//     for (int x = 0; x < data.cols; x += blockSize.width) {
+//       cv::cuda::GpuMat d_block;
+//       // 计算当前块的范围
+//       cv::Rect roi(x, y, blockSize.width, blockSize.height);
+//       // 确保不超出边界
+//       roi.width = std::min(roi.width, data.cols - x);
+//       roi.height = std::min(roi.height, data.rows - y);
+//       d_mats[(count++) % n_stream].upload(data(roi),
+//                                           cv_streams[(count++) % n_stream]);
+//     }
+//   }
+//   cudaDeviceSynchronize();
+//   TIMEREND(block_8k_50k_opencv_cuda_2);
+//   DURATION_ms(block_8k_50k_opencv_cuda_2);
+// }
+
+// void block_8k_50k_cuda(const float* pinned_mem, float* d_blocks, int rows,
+//                        int cols) {
+//   TIMERSTART(block_8k_50k_cuda);
+
+//   cv::Size blockSize(1000, 800);
+
+//   for (int y = 0; y < rows; y += blockSize.height) {
+//     for (int x = 0; x < cols; x += blockSize.width) {
+//       // 计算当前块的范围
+//       cv::Rect roi(x, y, blockSize.width, blockSize.height);
+//       // 确保不超出边界
+//       roi.width = std::min(roi.width, cols - x);
+//       roi.height = std::min(roi.height, rows - y);
+//     }
+//   }
+//   TIMEREND(block_8k_50k_cuda);
+//   DURATION_ms(block_8k_50k_cuda);
+// }
+
+// void block_8k_50k_opencv_cpu(const cv::Mat& data) {
+//   TIMERSTART(block_8k_50k_opencv_cpu);
+
+//   cv::Size blockSize(1000, 800);
+//   int count = 0;
+//   std::cout << data.rows << "," << blockSize.width << std::endl;
+//   std::cout << data.cols << "," << blockSize.height << std::endl;
+
+//   for (int y = 0; y < data.rows; y += blockSize.height) {
+//     for (int x = 0; x < data.cols; x += blockSize.width) {
+//       // 计算当前块的范围
+//       cv::Rect roi(x, y, blockSize.width, blockSize.height);
+//       // 确保不超出边界
+//       roi.width = std::min(roi.width, data.cols - x);
+//       roi.height = std::min(roi.height, data.rows - y);
+//       cv::Mat block = data(roi);
+//       std::cout << x << "," << y << "," << roi.width << "," << roi.height <<
+//       ":"
+//                 << ++count << std::endl;
+//     }
+//   }
+//   TIMEREND(block_8k_50k_opencv_cpu);
+//   DURATION_ms(block_8k_50k_opencv_cpu);
+// }
+
+void captureImage(int cameraId, std::vector<cv::Mat>& images,
+                  std::mutex& cameraMutex, std::mutex& detectorMutex) {
+    cv::Mat image = cv::Mat::zeros(8000, 50000, CV_8UC3);
+    cameraMutex.lock();
+    images[cameraId] = image;
+    std::cout << "Camera " << cameraId << " captured image." << std::endl;
+    cameraMutex.unlock();
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+}
+// // 模拟检测器处理图片的函数
+void detectImage(int detectorId, YOLOInfer& det, cv::cuda::GpuMat& d_mat,
+                 cv::cuda::Stream& cv_stream, std::vector<cv::Mat>& images,
+                 std::mutex& cameraMutex, std::mutex& detectorMutex) {
+
+}
+
+int main() {
+  // 创建五个检测器
+  int batch_num = 20;
+  std::vector<std::thread> detectorThreads;
+  std::mutex cameraMutex;
+  std::mutex detectorMutex;
+  std::vector<cv::Mat> images;
+  std::vector<YOLOInfer> model_set;
+  std::vector<cv::cuda::GpuMat> dMat_set;
+  std::vector<cv::cuda::Stream> cvStream_set;
+
+  dMat_set.reserve(5);
+  model_set.resize(5);
+  cvStream_set.resize(5);
+  images.resize(5);
+  for (int i = 0; i < i < 5; ++i) {
+    model_set[i].SetUp("model.trt", 30, true, batch_num, 1024, 1024, {0, 0, 0},
+                       {1, 1, 1});
+    cvStream_set[i] = cv::cuda::Stream();
+  }
+
+  // // 创建相机线程
+  // std::vector<std::thread> cameraThreads;
+  // for (int i = 0; i < 5; ++i) {
+  //   cameraThreads.emplace_back(captureImage, i, std::ref(images),
+  //                              std::ref(cameraMutex), std::ref(detectorMutex));
+  // }
+
+  // // 创建检测器线程
+  // std::vector<std::thread> detectorThreads;
+  // for (int i = 0; i < 5; ++i) {
+  //     detectorThreads.emplace_back(detectImage, i,model_set[i],dMat_set[i],
+  //     cvStream_set[i],std::ref(images), std::ref(cameraMutex),
+  //     std::ref(detectorMutex));
+  // }
+
+  // 主线程可以继续执行其他任务，或者等待退出
+
+  // 主线程等待所有检测器线程结束
+  // for (auto& thread : detectorThreads) {
+  //   thread.join();
+  // }
+
+  return 0;
+}
+
+// int main(int, char**) {
+//   // cv::Mat bigMat(8000, 50000, CV_8UC3);  // 假设为float类型
+//   // std::cout << "void block_8k_50k_opencv_cuda() " << std::endl;
+//   // for (int i = 0; i < 10; ++i) block_8k_50k_opencv_cuda(bigMat);
+//   // std::cout << "void block_8k_50k_opencv_cuda_2() " << std::endl;
+//   // for (int i = 0; i < 10; ++i) block_8k_50k_opencv_cuda_2(bigMat, 10);
+//   // std::cout << "void block_8k_50k_cuda() " << std::endl;
+//   // float *pinned_mem;
+//   // cudaMallocHost(&pinned_mem, bigMat.channels() * bigMat.rows *
+//   bigMat.cols *
+//   // sizeof(float)); float *d_blocks; cudaMalloc(&d_blocks, bigMat.channels()
+//   *
+//   // bigMat.rows * bigMat.cols * sizeof(float) * sizeof(float));
+
+//   // std::cout << "void block_8k_50k_opencv_cpu() " << std::endl;
+//   // for (int i = 0; i < 10; ++i) block_8k_50k_opencv_cpu(bigMat);
+//   // std::cout << "test_navie" << std::endl;
+//   // test_navie(20, 1, 500, 1);
+//   // std::cout << "test_navie_2" << std::endl;
+//   // test_navie_2(20, 1, 500, 1);
+//   std::cout << "test_navie_3" << std::endl;
+//   test_navie_3(20, 1, 500, 1);
+//   // std::cout << "test_thread_pool" << std::endl;
+//   // test_thread_pool(20, 1, 500, 5, 4);
+//   getchar();
+//   return 0;
+// }
