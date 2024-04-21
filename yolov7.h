@@ -8,8 +8,8 @@ class YOLOInfer : public BaseInfer {
   bool Infer(const std::vector<cv::Mat>& mat);
   bool Infer(const cv::cuda::GpuMat& d_mat, const std::vector<cv::Rect>& rois);
   bool Infer(const std::vector<cv::Rect>& rois);
-  bool LoadData(const cv::Mat& data);
-  bool LoadData(const cv::cuda::HostMem& data);
+  void LoadData(const cv::Mat& data);
+  void LoadData(const cv::cuda::HostMem& data);
 
   bool GetRes(std::vector<DetPredictorOutput>& res);
   cudaStream_t GetCudaStream();
@@ -48,6 +48,18 @@ class YOLOInfer : public BaseInfer {
   size_t pitch_;
   uchar3 *d_mat_data_ = nullptr;
   std::vector<int> out_size_{1, 1, 1, 1};
+  
+  int *h_x = nullptr;
+  int *h_y = nullptr;
+  int *h_w = nullptr;
+  int *h_h = nullptr;
+
+  int *d_x = nullptr;
+  int *d_y = nullptr;
+  int *d_w = nullptr;
+  int *d_h = nullptr;
+	float *d_means = nullptr;
+	float *d_stds = nullptr;
   int* num_dets_ = nullptr;
   float* det_boxes_ = nullptr;
   float* det_scores_ = nullptr;

@@ -7,16 +7,17 @@ extern "C" void ROI_BGR2RGB_NORM(const cv::cuda::GpuMat &input, float *output,
                                  int roi_x, int roi_y, int roi_width,
                                  int roi_height, cudaStream_t stream);
 
+// extern "C" void Batch_ROI_BGR2RGB_NORM(const cv::cuda::GpuMat &input,
+//                                        float *output, int batch,
+//                                        const float *means, const float *stds,
+//                                        const std::vector<cv::Rect> &rois,
+//                                        cudaStream_t stream);
 extern "C" void Batch_ROI_BGR2RGB_NORM(const cv::cuda::GpuMat &input,
-                                       float *output, int batch,
-                                       const float *means, const float *stds,
-                                       const std::vector<cv::Rect> &rois,
-                                       cudaStream_t stream);
-extern "C" void Batch_ROI_BGR2RGB_NORM_2(const uchar3 *input, float *output,
-                                         int batch, const float *means,
-                                         const float *stds,
-                                         const std::vector<cv::Rect> &rois,
-                                         const cudaStream_t stream);
+                                       float *output, int batch, int roi_width,
+                                       int roi_height, float *d_means,
+                                       float *d_stds, int *d_x, int *d_y,
+                                       int *d_w, int *d_h,
+                                       const cudaStream_t stream);
 bool YOLOInfer::SetUp(const std::string &model_path, const int work_space,
                       const bool fp16, const int batch_num, const int det_width,
                       const int det_height, const std::vector<float> means,
@@ -26,11 +27,27 @@ bool YOLOInfer::SetUp(const std::string &model_path, const int work_space,
   batch_num_ = batch_num;
   means_ = means;
   stds_ = stds;
+  cudaMalloc(&d_means, 3 * sizeof(float));
+  cudaMalloc(&d_stds, 3 * sizeof(float));
+  h_x = new int[batch_num];
+  h_y = new int[batch_num];
+  h_w = new int[batch_num];
+  h_h = new int[batch_num];
+
+  cudaMalloc(&d_x, batch_num * sizeof(int));
+  cudaMalloc(&d_y, batch_num * sizeof(int));
+  cudaMalloc(&d_w, batch_num * sizeof(int));
+  cudaMalloc(&d_h, batch_num * sizeof(int));
   streams_mat_.resize(batch_num);
   d_mats_.resize(batch_num);
   CUDACHECK(cudaStreamCreate(&stream_));
+  cudaMemcpyAsync(d_means, means.data(), 3 * sizeof(float),
+                  cudaMemcpyHostToDevice, stream_);
+  cudaMemcpyAsync(d_stds, stds.data(), 3 * sizeof(float),
+                  cudaMemcpyHostToDevice, stream_);
+
   cuda_streams_.resize(batch_num);
-  big_d_mat = cv::cuda::GpuMat(8000,50000,CV_8UC3);
+  big_d_mat = cv::cuda::GpuMat(8000, 51200, CV_8UC3);
   // cudaMallocPitch((void **)&d_mat_data_, (size_t *)&pitch_,
   //                 (size_t)(50000) * sizeof(uchar3), (size_t)(8000));
   // for (int stream_i = 0; stream_i < batch_num; ++stream_i) {
@@ -73,17 +90,14 @@ bool YOLOInfer::Infer(const std::vector<cv::Rect> &rois) {
   return EffInfer(rois);
 }
 
-bool YOLOInfer::LoadData(const cv::Mat &data) {
+void YOLOInfer::LoadData(const cv::Mat &data) {
   cudaMemcpy2DAsync(d_mat_data_, pitch_, data.data, sizeof(uchar3) * data.cols,
                     sizeof(uchar3) * data.cols, data.rows,
                     cudaMemcpyHostToDevice, stream_);
-  return true;
 }
 
-bool YOLOInfer::LoadData(const cv::cuda::HostMem &data)
-{
-    big_d_mat.upload(data, cv::cuda::StreamAccessor::wrapStream(stream_));
-    return true;
+void YOLOInfer::LoadData(const cv::cuda::HostMem &data) {
+  big_d_mat.upload(data, cv::cuda::StreamAccessor::wrapStream(stream_));
 }
 
 bool YOLOInfer::GetRes(std::vector<DetPredictorOutput> &res) {
@@ -137,7 +151,27 @@ bool YOLOInfer::GetRes(std::vector<DetPredictorOutput> &res) {
 
 cudaStream_t YOLOInfer::GetCudaStream() { return stream_; }
 
-YOLOInfer::~YOLOInfer() {}
+YOLOInfer::~YOLOInfer() {
+  delete h_x;
+  delete h_y;
+  delete h_w;
+  delete h_h;
+  delete num_dets_;
+  delete det_scores_;
+  delete det_classes_;
+  delete in_data_;
+  cudaFree(d_x);
+  cudaFree(d_y);
+  cudaFree(d_w);
+  cudaFree(d_h);
+  cudaFree(d_means);
+  cudaFree(d_stds);
+  cudaStreamDestroy(stream_);
+  for (int i = 0; i < 5; ++i) {
+    cudaFree(buffs_[i]);
+  }
+  delete context_;
+}
 
 bool YOLOInfer::NavieInfer(const std::vector<cv::Mat> &mat) { return false; }
 
@@ -170,8 +204,23 @@ bool YOLOInfer::EffInfer(const std::vector<cv::Mat> &mat) {
 }
 
 bool YOLOInfer::EffInfer(const std::vector<cv::Rect> &rois) {
-  Batch_ROI_BGR2RGB_NORM(big_d_mat, (float *)buffs_[0], batch_num_, means_.data(),
-                         stds_.data(), rois, stream_);
+  for (int i = 0; i < rois.size(); ++i) {
+    h_y[i] = rois[i].y;
+    h_x[i] = rois[i].x;
+    h_w[i] = rois[i].width;
+    h_h[i] = rois[i].height;
+  }
+  cudaMemcpyAsync(d_x, h_x, rois.size() * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  cudaMemcpyAsync(d_y, h_y, rois.size() * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  cudaMemcpyAsync(d_w, h_w, rois.size() * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  cudaMemcpyAsync(d_h, h_h, rois.size() * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  Batch_ROI_BGR2RGB_NORM(big_d_mat, (float *)buffs_[0], batch_num_,
+                         rois[0].width, rois[0].height, d_means, d_stds, d_x,
+                         d_y, d_w, d_h, stream_);
   // Batch_ROI_BGR2RGB_NORM_2(d_mat_data_, (float *)buffs_[0], batch_num_,
   //                          means_.data(), stds_.data(), rois, stream_);
   context_->enqueueV2(&buffs_[0], stream_, nullptr);
@@ -194,8 +243,9 @@ bool YOLOInfer::EffInfer(const std::vector<cv::Rect> &rois) {
 bool YOLOInfer::EffInfer(const cv::cuda::GpuMat &d_mat,
                          const std::vector<cv::Rect> &rois) {
   // TIMERSTART(EffInfer);
-  Batch_ROI_BGR2RGB_NORM(d_mat, (float *)buffs_[0], batch_num_, means_.data(),
-                         stds_.data(), rois, stream_);
+  // Batch_ROI_BGR2RGB_NORM(d_mat, (float *)buffs_[0], batch_num_,
+  // means_.data(),
+  //                        stds_.data(), rois, stream_);
   // #pragma omp parallel for
   // for (int i = 0; i < rois.size(); ++i) {
   //   ROI_BGR2RGB_NORM(d_mat,(float *)buffs_[0] + i * 3 * det_height_ *
@@ -215,17 +265,19 @@ bool YOLOInfer::EffInfer(const cv::cuda::GpuMat &d_mat,
   // DURATION_ms(ROI_PREPROCESS_TIME);
 
   // TIMERSTART(ENQUENE_TIME);
-  context_->enqueueV2(&buffs_[0], stream_, nullptr);
-  CUDACHECK(cudaMemcpyAsync(num_dets_, buffs_[1], out_size_[0] * sizeof(int),
-                            cudaMemcpyDeviceToHost, stream_));
-  CUDACHECK(cudaMemcpyAsync(det_boxes_, buffs_[2], out_size_[1] * sizeof(float),
-                            cudaMemcpyDeviceToHost, stream_));
-  CUDACHECK(cudaMemcpyAsync(det_scores_, buffs_[3],
-                            out_size_[2] * sizeof(float),
-                            cudaMemcpyDeviceToHost, stream_));
-  CUDACHECK(cudaMemcpyAsync(det_classes_, buffs_[4], out_size_[3] * sizeof(int),
-                            cudaMemcpyDeviceToHost, stream_));
-  cudaStreamSynchronize(stream_);
+  // context_->enqueueV2(&buffs_[0], stream_, nullptr);
+  // CUDACHECK(cudaMemcpyAsync(num_dets_, buffs_[1], out_size_[0] * sizeof(int),
+  //                           cudaMemcpyDeviceToHost, stream_));
+  // CUDACHECK(cudaMemcpyAsync(det_boxes_, buffs_[2], out_size_[1] *
+  // sizeof(float),
+  //                           cudaMemcpyDeviceToHost, stream_));
+  // CUDACHECK(cudaMemcpyAsync(det_scores_, buffs_[3],
+  //                           out_size_[2] * sizeof(float),
+  //                           cudaMemcpyDeviceToHost, stream_));
+  // CUDACHECK(cudaMemcpyAsync(det_classes_, buffs_[4], out_size_[3] *
+  // sizeof(int),
+  //                           cudaMemcpyDeviceToHost, stream_));
+  // cudaStreamSynchronize(stream_);
   // TIMEREND(EffInfer);
   // DURATION_ms(EffInfer);
 

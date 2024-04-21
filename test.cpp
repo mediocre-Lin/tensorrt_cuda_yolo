@@ -37,6 +37,7 @@ void detectImage(int id, int batch_num, YOLOv8Infer &det,
     for (int i = 0; i < 5; ++i) {
       TIMERSTART(WARMUP_TIME);
       det.LoadData(mem[id]);
+
       cv::Size blockSize(1024, 800);
 
       std::vector<std::vector<cv::Rect>> roi_set;
@@ -53,13 +54,15 @@ void detectImage(int id, int batch_num, YOLOv8Infer &det,
       for (int y = 0; y < 8000; y += blockSize.height) {
         for (int x = 0; x < 51200; x += blockSize.width) {
           cv::Rect roi(x, y, blockSize.width, blockSize.height);
-          roi.width = std::min(roi.width, 51200 - x);
-          roi.height = std::min(roi.height, 8000 - y);
+          roi.width = std::min(roi.width, 8000 - x);
+          roi.height = std::min(roi.height, 51200 - y);
           roi_set[count / batch_num][count % batch_num] = roi;
           count++;
         }
       }
       // #pragma omp parallel for
+      // det.big_d_mat.upload(mem[id],cv::cuda::StreamAccessor::wrapStream(det.stream_));
+
       for (int i = 0; i < roi_set_num; ++i) {
         det.Infer(roi_set[i]);
         det.GetRes(res[i]);
@@ -76,7 +79,8 @@ void detectImage(int id, int batch_num, YOLOv8Infer &det,
       }
       //计时
       TIMERSTART(costTime);
-      det.LoadData(mem[id]);
+      // det.LoadData(mem[id]);
+
       cv::Size blockSize(1024, 800);
 
       std::vector<std::vector<cv::Rect>> roi_set;
@@ -100,6 +104,8 @@ void detectImage(int id, int batch_num, YOLOv8Infer &det,
         }
       }
       // #pragma omp parallel for
+      // det.big_d_mat.upload(mem[id],cv::cuda::StreamAccessor::wrapStream(det.stream_));
+
       for (int i = 0; i < roi_set_num; ++i) {
         det.Infer(roi_set[i]);
         det.GetRes(res[i]);
@@ -123,6 +129,8 @@ void getGPUInfo() {
   std::cout << "deviceOverlap: " << prop.deviceOverlap << std::endl;
 }
 int main() {
+  getGPUInfo();
+  cudaSetDeviceFlags(cudaDeviceMapHost);
   int batch_num = 50;
   int detector_num = 3;
   int camera_num = 3;
@@ -135,7 +143,7 @@ int main() {
   model_set.resize(detector_num);
   mems.resize(camera_num);
   for (int i = 0; i < detector_num; ++i) {
-    model_set[i].SetUp("model.trt", 30, true, batch_num, 1024, 800, {0, 0, 0},
+    model_set[i].SetUp("model.trt", 32, true, batch_num, 1024, 800, {0, 0, 0},
                        {1, 1, 1});
   }
   for (int i = 0; i < camera_num; ++i) {
@@ -143,7 +151,7 @@ int main() {
     mems[i] = cv::cuda::HostMem(cv::Mat::zeros(8000, 51200, CV_8UC3),
                                 cv::cuda::HostMem::AllocType::PAGE_LOCKED);
     std::cout << "HostMem End" << std::endl;
-  }
+  }                                                                                                   
 
   // warm up
   for (int i = 0; i < detector_num; ++i) {
@@ -154,7 +162,7 @@ int main() {
 
   for (int i = 0; i < detector_num; ++i) {
     detectorThreads.emplace_back(detectImage, i, batch_num, model_set[i], mems,
-                                 std::ref(recorder), false);
+                                  std::ref(recorder), false);
   }
   for (int i = 0; i < camera_num; ++i) {
     cameraThreads.emplace_back(captureImage, i, std::ref(recorder));

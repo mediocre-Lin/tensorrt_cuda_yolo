@@ -6,31 +6,48 @@ extern "C" void ROI_BGR2RGB_NORM(const cv::cuda::GpuMat &input, float *output,
                                  const float *means, const float *stds,
                                  int roi_x, int roi_y, int roi_width,
                                  int roi_height, cudaStream_t stream);
-
 extern "C" void Batch_ROI_BGR2RGB_NORM(const cv::cuda::GpuMat &input,
-                                       float *output, int batch,
-                                       const float *means, const float *stds,
-                                       const std::vector<cv::Rect> &rois,
-                                       cudaStream_t stream);
-extern "C" void Batch_ROI_BGR2RGB_NORM_2(const uchar3 *input, float *output,
-                                         int batch, const float *means,
-                                         const float *stds,
-                                         const std::vector<cv::Rect> &rois,
-                                         const cudaStream_t stream);
+                                       float *output, int batch, int roi_width,
+                                       int roi_height, float *d_means,
+                                       float *d_stds, int *d_x, int *d_y,
+                                       int *d_w, int *d_h,
+                                       const cudaStream_t stream);
 bool YOLOv8Infer::SetUp(const std::string &model_path, const int work_space,
-                      const bool fp16, const int batch_num, const int det_width,
-                      const int det_height, const std::vector<float> means,
-                      const std::vector<float> stds) {
+                        const bool fp16, const int batch_num,
+                        const int det_width, const int det_height,
+                        const std::vector<float> means,
+                        const std::vector<float> stds) {
   det_width_ = det_width;
   det_height_ = det_height;
   batch_num_ = batch_num;
   means_ = means;
   stds_ = stds;
-  streams_mat_.resize(batch_num);
+  cudaMalloc(&d_means, 3 * sizeof(float));
+  cudaMalloc(&d_stds, 3 * sizeof(float));
+  h_x = new int[batch_num];
+  h_y = new int[batch_num];
+  h_w = new int[batch_num];
+  h_h = new int[batch_num];
+  cudaMallocHost((void**)&h_x,batch_num * sizeof(int));
+  cudaMallocHost((void**)&h_y,batch_num * sizeof(int));
+  cudaMallocHost((void**)&h_w,batch_num * sizeof(int));
+  cudaMallocHost((void**)&h_h,batch_num * sizeof(int));
+
+  cudaMalloc(&d_x, batch_num * sizeof(int));
+  cudaMalloc(&d_y, batch_num * sizeof(int));
+  cudaMalloc(&d_w, batch_num * sizeof(int));
+  cudaMalloc(&d_h, batch_num * sizeof(int));
+  // streams_mat_.resize(batch_num);
   d_mats_.resize(batch_num);
   CUDACHECK(cudaStreamCreate(&stream_));
-  cuda_streams_.resize(batch_num);
-  big_d_mat = cv::cuda::GpuMat(8000,51200,CV_8UC3);
+  cudaMemcpyAsync(d_means, means.data(), 3 * sizeof(float),
+                  cudaMemcpyHostToDevice, stream_);
+  cudaMemcpyAsync(d_stds, stds.data(), 3 * sizeof(float),
+                  cudaMemcpyHostToDevice, stream_);
+
+  // cuda_streams_.resize(batch_num);
+  big_d_mat = cv::cuda::GpuMat(8000, 51200, CV_8UC3);
+  stream_mat_ = cv::cuda::StreamAccessor::wrapStream(stream_);
   // cudaMallocPitch((void **)&d_mat_data_, (size_t *)&pitch_,
   //                 (size_t)(50000) * sizeof(uchar3), (size_t)(8000));
   // for (int stream_i = 0; stream_i < batch_num; ++stream_i) {
@@ -61,7 +78,7 @@ bool YOLOv8Infer::Infer(const std::vector<cv::Mat> &mat) {
 }
 
 bool YOLOv8Infer::Infer(const cv::cuda::GpuMat &d_mat,
-                      const std::vector<cv::Rect> &rois) {
+                        const std::vector<cv::Rect> &rois) {
   ori_width_ = rois[0].width;
   ori_height_ = rois[0].height;
   return EffInfer(d_mat, rois);
@@ -73,17 +90,14 @@ bool YOLOv8Infer::Infer(const std::vector<cv::Rect> &rois) {
   return EffInfer(rois);
 }
 
-bool YOLOv8Infer::LoadData(const cv::Mat &data) {
+void YOLOv8Infer::LoadData(const cv::Mat &data) {
   cudaMemcpy2DAsync(d_mat_data_, pitch_, data.data, sizeof(uchar3) * data.cols,
                     sizeof(uchar3) * data.cols, data.rows,
                     cudaMemcpyHostToDevice, stream_);
-  return true;
 }
 
-bool YOLOv8Infer::LoadData(const cv::cuda::HostMem &data)
-{
-    big_d_mat.upload(data, cv::cuda::StreamAccessor::wrapStream(stream_));
-    return true;
+void YOLOv8Infer::LoadData(const cv::cuda::HostMem &data) {
+  big_d_mat.upload(data, stream_mat_);
 }
 
 bool YOLOv8Infer::GetRes(std::vector<DetPredictorOutput> &res) {
@@ -137,41 +151,76 @@ bool YOLOv8Infer::GetRes(std::vector<DetPredictorOutput> &res) {
 
 cudaStream_t YOLOv8Infer::GetCudaStream() { return stream_; }
 
-YOLOv8Infer::~YOLOv8Infer() {}
+YOLOv8Infer::~YOLOv8Infer(){
+  cudaFreeHost(h_x);
+  cudaFreeHost(h_y);
+  cudaFreeHost(h_w);
+  cudaFreeHost(h_h);
+  delete num_dets_;
+  delete det_scores_;
+  delete det_classes_;
+  delete in_data_;
+  cudaFree(d_x);
+  cudaFree(d_y);
+  cudaFree(d_w);
+  cudaFree(d_h);
+  cudaFree(d_means);
+  cudaFree(d_stds);
+  cudaStreamDestroy(stream_);
+  for (int i = 0; i < 5; ++i) {
+    cudaFree(buffs_[i]);
+  }
+  delete context_;
+}
 
 bool YOLOv8Infer::NavieInfer(const std::vector<cv::Mat> &mat) { return false; }
 
 bool YOLOv8Infer::EffInfer(const std::vector<cv::Mat> &mat) {
-  for (int i = 0; i < mat.size(); ++i) {
-    d_mats_[i].upload(mat[i], streams_mat_[i]);
-    D_Preprocess(d_mats_[i], streams_mat_[i]);
-    toNCHW_Norm(d_mats_[i],
-                (float *)buffs_[0] + i * 3 * det_height_ * det_width_,
-                means_.data(), stds_.data(),
-                cv::cuda::StreamAccessor::getStream(streams_mat_[i]));
-  }
+  // for (int i = 0; i < mat.size(); ++i) {
+  //   d_mats_[i].upload(mat[i], streams_mat_[i]);
+  //   D_Preprocess(d_mats_[i], streams_mat_[i]);
+  //   toNCHW_Norm(d_mats_[i],
+  //               (float *)buffs_[0] + i * 3 * det_height_ * det_width_,
+  //               means_.data(), stds_.data(),
+  //               cv::cuda::StreamAccessor::getStream(streams_mat_[i]));
+  // }
 
-  for (int ei = 0; ei < mat.size(); ++ei) {
-    streams_mat_[ei].waitForCompletion();
-  }
+  // for (int ei = 0; ei < mat.size(); ++ei) {
+  //   streams_mat_[ei].waitForCompletion();
+  // }
 
-  context_->enqueueV2(&buffs_[0], stream_, nullptr);
-  CUDACHECK(cudaMemcpyAsync(num_dets_, buffs_[1], out_size_[0] * sizeof(int),
-                            cudaMemcpyDeviceToHost, stream_));
-  CUDACHECK(cudaMemcpyAsync(det_boxes_, buffs_[2], out_size_[1] * sizeof(float),
-                            cudaMemcpyDeviceToHost, stream_));
-  CUDACHECK(cudaMemcpyAsync(det_scores_, buffs_[3],
-                            out_size_[2] * sizeof(float),
-                            cudaMemcpyDeviceToHost, stream_));
-  CUDACHECK(cudaMemcpyAsync(det_classes_, buffs_[4], out_size_[3] * sizeof(int),
-                            cudaMemcpyDeviceToHost, stream_));
+  // context_->enqueueV2(&buffs_[0], stream_, nullptr);
+  // CUDACHECK(cudaMemcpyAsync(num_dets_, buffs_[1], out_size_[0] * sizeof(int),
+  //                           cudaMemcpyDeviceToHost, stream_));
+  // CUDACHECK(cudaMemcpyAsync(det_boxes_, buffs_[2], out_size_[1] * sizeof(float),
+  //                           cudaMemcpyDeviceToHost, stream_));
+  // CUDACHECK(cudaMemcpyAsync(det_scores_, buffs_[3],
+  //                           out_size_[2] * sizeof(float),
+  //                           cudaMemcpyDeviceToHost, stream_));
+  // CUDACHECK(cudaMemcpyAsync(det_classes_, buffs_[4], out_size_[3] * sizeof(int),
+  //                           cudaMemcpyDeviceToHost, stream_));
 
   return true;
 }
 
 bool YOLOv8Infer::EffInfer(const std::vector<cv::Rect> &rois) {
-  Batch_ROI_BGR2RGB_NORM(big_d_mat, (float *)buffs_[0], batch_num_, means_.data(),
-                         stds_.data(), rois, stream_);
+  for (int i = 0; i < rois.size(); ++i) {
+    h_y[i] = rois[i].y;
+    h_x[i] = rois[i].x;
+    h_w[i] = rois[i].width;
+    h_h[i] = rois[i].height;
+  }
+  cudaMemcpyAsync(d_x, h_x, rois.size() * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  cudaMemcpyAsync(d_y, h_y, rois.size() * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  cudaMemcpyAsync(d_w, h_w, rois.size() * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  cudaMemcpyAsync(d_h, h_h, rois.size() * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  Batch_ROI_BGR2RGB_NORM(big_d_mat, (float *)buffs_[0], batch_num_,
+                         rois[0].width, rois[0].height, d_means, d_stds, d_x,
+                         d_y, d_w, d_h, stream_);
   // Batch_ROI_BGR2RGB_NORM_2(d_mat_data_, (float *)buffs_[0], batch_num_,
   //                          means_.data(), stds_.data(), rois, stream_);
   context_->enqueueV2(&buffs_[0], stream_, nullptr);
@@ -192,10 +241,11 @@ bool YOLOv8Infer::EffInfer(const std::vector<cv::Rect> &rois) {
 }
 
 bool YOLOv8Infer::EffInfer(const cv::cuda::GpuMat &d_mat,
-                         const std::vector<cv::Rect> &rois) {
+                           const std::vector<cv::Rect> &rois) {
   // TIMERSTART(EffInfer);
-  Batch_ROI_BGR2RGB_NORM(d_mat, (float *)buffs_[0], batch_num_, means_.data(),
-                         stds_.data(), rois, stream_);
+  // Batch_ROI_BGR2RGB_NORM(d_mat, (float *)buffs_[0], batch_num_,
+  // means_.data(),
+  //                        stds_.data(), rois, stream_);
   // #pragma omp parallel for
   // for (int i = 0; i < rois.size(); ++i) {
   //   ROI_BGR2RGB_NORM(d_mat,(float *)buffs_[0] + i * 3 * det_height_ *
@@ -263,25 +313,28 @@ bool YOLOv8Infer::InitIO() {
 }
 
 bool YOLOv8Infer::NMSPlugin() {
- auto previous_output = network_->getOutput(0);
+  auto previous_output = network_->getOutput(0);
   network_->unmarkOutput(*previous_output);
 
-  nvinfer1::Dims3 * strides= new nvinfer1::Dims3(1,1,1);
-  nvinfer1::Dims3 * starts = new nvinfer1::Dims3(0,0,0);
+  nvinfer1::Dims3 *strides = new nvinfer1::Dims3(1, 1, 1);
+  nvinfer1::Dims3 *starts = new nvinfer1::Dims3(0, 0, 0);
   auto add_shuffle = network_->addShuffle(*previous_output);
-  add_shuffle->setSecondTranspose({0,2,1});
-  
+  add_shuffle->setSecondTranspose({0, 2, 1});
+
   auto bs = add_shuffle->getOutput(0)->getDimensions().d[0];
   auto numBoxes = add_shuffle->getOutput(0)->getDimensions().d[1];
   auto temp = add_shuffle->getOutput(0)->getDimensions().d[2];
-  std::cout << "bs :" << bs << "," << "numBoxes: " << numBoxes << "," << "temp:" << temp << std::endl;
-  nvinfer1::Dims3 * shapes = new nvinfer1::Dims3(bs, numBoxes, 4);
-  auto boxes = network_->addSlice(*add_shuffle->getOutput(0), *starts, *shapes, *strides);
-  numBoxes = temp -4;
+  std::cout << "bs :" << bs << ","
+            << "numBoxes: " << numBoxes << ","
+            << "temp:" << temp << std::endl;
+  nvinfer1::Dims3 *shapes = new nvinfer1::Dims3(bs, numBoxes, 4);
+  auto boxes = network_->addSlice(*add_shuffle->getOutput(0), *starts, *shapes,
+                                  *strides);
+  numBoxes = temp - 4;
   starts->d[2] = 4;
   shapes->d[2] = numBoxes;
-  auto scores =
-    network_->addSlice(*add_shuffle->getOutput(0), *starts, *shapes, *strides);
+  auto scores = network_->addSlice(*add_shuffle->getOutput(0), *starts, *shapes,
+                                   *strides);
 
   /*
           "plugin_version": "1",
@@ -343,10 +396,11 @@ bool YOLOv8Infer::NMSPlugin() {
 }
 
 float YOLOv8Infer::D_letterbox(cv::cuda::GpuMat image,
-                             cv::cuda::GpuMat &out_image,
-                             cv::cuda::Stream stream, const cv::Size &new_shape,
-                             int stride, const cv::Scalar &color,
-                             bool fixed_shape, bool scale_up) {
+                               cv::cuda::GpuMat &out_image,
+                               cv::cuda::Stream stream,
+                               const cv::Size &new_shape, int stride,
+                               const cv::Scalar &color, bool fixed_shape,
+                               bool scale_up) {
   cv::Size shape = image.size();
   float r = std::min((float)new_shape.height / (float)shape.height,
                      (float)new_shape.width / (float)shape.width);
@@ -381,7 +435,8 @@ float YOLOv8Infer::D_letterbox(cv::cuda::GpuMat image,
   return 1.0f / r;
 }
 
-void YOLOv8Infer::D_Preprocess(cv::cuda::GpuMat &image, cv::cuda::Stream stream) {
+void YOLOv8Infer::D_Preprocess(cv::cuda::GpuMat &image,
+                               cv::cuda::Stream stream) {
   scale_ = D_letterbox(image, image, stream, {det_width_, det_height_}, 32,
                        {114, 114, 114}, true);
   cv::cuda::cvtColor(image, image, cv::COLOR_BGR2RGB, 0, stream);

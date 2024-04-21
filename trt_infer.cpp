@@ -31,7 +31,9 @@ bool BaseInfer::BuildEngine(const int workspace_size, bool fp16) {
   if (fp16) {
     std::cout << "Build with FP16 Mode" << std::endl;
     config_->setFlag(nvinfer1::BuilderFlag::kFP16);
+    // config_->setPreviewFeature(nvinfer1::PreviewFeature::kDISABLE_EXTERNAL_TACTIC_SOURCES_FOR_CORE_0805, 0);
     // config_.back()->setAvgTimingIterations(16);
+    config_->setAvgTimingIterations(16);
   } else {
     if (!builder_->platformHasTf32()) {
       std::cout << "WARN: your platform has no TF32, will turn to Normal Mode"

@@ -8,12 +8,15 @@ class YOLOv8Infer : public BaseInfer {
   bool Infer(const std::vector<cv::Mat>& mat);
   bool Infer(const cv::cuda::GpuMat& d_mat, const std::vector<cv::Rect>& rois);
   bool Infer(const std::vector<cv::Rect>& rois);
-  bool LoadData(const cv::Mat& data);
-  bool LoadData(const cv::cuda::HostMem& data);
+  void LoadData(const cv::Mat& data);
+  void LoadData(const cv::cuda::HostMem& data);
 
   bool GetRes(std::vector<DetPredictorOutput>& res);
   cudaStream_t GetCudaStream();
   ~YOLOv8Infer();
+  cv::cuda::GpuMat big_d_mat;
+  cudaStream_t stream_ = nullptr;
+
  private:
   bool NavieInfer(const std::vector<cv::Mat>& mat);
   bool EffInfer(const std::vector<cv::Mat>& mat);
@@ -31,11 +34,10 @@ class YOLOv8Infer : public BaseInfer {
   void D_Preprocess(cv::cuda::GpuMat& image,cv::cuda::Stream stream);
   bool BlobFromImg(const cv::Mat& img, float* blob);
   nvinfer1::IExecutionContext* context_ = nullptr;
-  std::vector<cv::cuda::Stream> streams_mat_;
+  cv::cuda::Stream stream_mat_;
   std::vector<cudaStream_t> cuda_streams_;
-  cudaStream_t stream_ = nullptr;
+
   std::vector<cv::cuda::GpuMat> d_mats_;
-  cv::cuda::GpuMat big_d_mat;
   int batch_num_= 1;
   int det_width_;
   int det_height_;
@@ -48,6 +50,17 @@ class YOLOv8Infer : public BaseInfer {
   size_t pitch_;
   uchar3 *d_mat_data_ = nullptr;
   std::vector<int> out_size_{1, 1, 1, 1};
+  int *h_x = nullptr;
+  int *h_y = nullptr;
+  int *h_w = nullptr;
+  int *h_h = nullptr;
+
+  int *d_x = nullptr;
+  int *d_y = nullptr;
+  int *d_w = nullptr;
+  int *d_h = nullptr;
+	float *d_means = nullptr;
+	float *d_stds = nullptr;
   int* num_dets_ = nullptr;
   float* det_boxes_ = nullptr;
   float* det_scores_ = nullptr;
